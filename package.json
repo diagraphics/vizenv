@@ -3,6 +3,9 @@
   "type": "module",
   "bin": "./bin/vizenv.js",
   "packageManager": "yarn@4.13.0",
+  "scripts": {
+    "test": "node --test"
+  },
   "devDependencies": {
     "dotenv": "^17.3.1"
   },

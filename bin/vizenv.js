@@ -1,163 +1,41 @@
-import { readFileSync, existsSync } from "fs";
-import { execSync } from "child_process";
-import { parse as parseYaml } from "yaml";
+#!/usr/bin/env node
 import { parse as parseDotenv } from "dotenv";
-import { resolve } from "path";
+import {
+  readIfExists,
+  extractComposeEnvVars,
+  getSearcher,
+  buildRows,
+} from "../lib/vizenv.js";
 
 const dir = process.cwd();
 
-function readIfExists(filename) {
-  const path = resolve(dir, filename);
-  if (!existsSync(path)) return null;
-  return readFileSync(path, "utf-8");
-}
-
-function extractComposeEnvVars(composeContent) {
-  if (!composeContent) return {};
-  const doc = parseYaml(composeContent);
-  const vars = {};
-
-  if (!doc?.services) return vars;
-
-  for (const [, service] of Object.entries(doc.services)) {
-    const env = service?.environment;
-    if (!env) continue;
-
-    if (Array.isArray(env)) {
-      for (const entry of env) {
-        const eqIdx = entry.indexOf("=");
-        if (eqIdx === -1) {
-          vars[entry] = { value: "", type: "empty" };
-        } else {
-          const key = entry.slice(0, eqIdx);
-          const val = entry.slice(eqIdx + 1);
-          vars[key] = categorize(val);
-        }
-      }
-    } else if (typeof env === "object") {
-      for (const [key, val] of Object.entries(env)) {
-        if (val === null || val === undefined) {
-          vars[key] = { value: "", type: "empty" };
-        } else {
-          vars[key] = categorize(String(val));
-        }
-      }
-    }
-  }
-
-  return vars;
-}
-
-function categorize(val) {
-  // Check for Docker Compose variable interpolation: ${VAR} or ${VAR:-default} or $VAR
-  if (/\$\{[^}]+\}/.test(val) || /\$[A-Za-z_][A-Za-z0-9_]*/.test(val)) {
-    return { value: val, type: "interpolation" };
-  }
-  return { value: val, type: "verbatim" };
-}
-
-// --- Search tool detection ---
-
-function which(cmd) {
-  try {
-    execSync(`which ${cmd}`, { stdio: "pipe" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const searchTools = [
-  {
-    name: "rg",
-    // Fixed-string, no filename, skip binary, exclude config files
-    buildCmd: (key) =>
-      `rg --fixed-strings --no-filename --count-matches -g '!.env' -g '!.env.example' -g '!compose.yaml' -g '!node_modules' -- ${JSON.stringify(key)} .`,
-  },
-  {
-    name: "ack",
-    buildCmd: (key) =>
-      `ack --literal --no-filename --count --ignore-dir=node_modules --ignore-file=match:/^\\.env/ --ignore-file=match:/^compose\\.yaml$/ -- ${JSON.stringify(key)} .`,
-  },
-  {
-    name: "ag",
-    buildCmd: (key) =>
-      `ag --literal --no-filename --count --ignore=node_modules --ignore=.env --ignore=.env.example --ignore=compose.yaml -- ${JSON.stringify(key)} .`,
-  },
-  {
-    name: "grep",
-    buildCmd: (key) =>
-      `grep -r --fixed-strings --exclude=.env --exclude=.env.example --exclude=compose.yaml --exclude-dir=node_modules -c -- ${JSON.stringify(key)} .`,
-  },
-];
-
-const searcher = searchTools.find((t) => which(t.name));
-
-function countOccurrences(key) {
-  if (!searcher) return "?";
-  try {
-    const out = execSync(searcher.buildCmd(key), {
-      stdio: ["pipe", "pipe", "pipe"],
-      cwd: dir,
-    }).toString();
-    // Each tool outputs lines of counts (or filename:count for grep).
-    // Sum them up.
-    let total = 0;
-    for (const line of out.trim().split("\n")) {
-      if (!line) continue;
-      // grep outputs file:count, others output just count
-      const num = parseInt(line.includes(":") ? line.split(":").pop() : line, 10);
-      if (!isNaN(num)) total += num;
-    }
-    return total;
-  } catch {
-    // Exit code 1 = no matches
-    return 0;
-  }
-}
-
-// --- Main ---
-
-const envRaw = readIfExists(".env");
-const exampleRaw = readIfExists(".env.example");
-const composeRaw = readIfExists("compose.yaml");
+const envRaw = readIfExists(dir, ".env");
+const exampleRaw = readIfExists(dir, ".env.example");
+const composeRaw = readIfExists(dir, "compose.yaml");
 
 const envVars = envRaw ? parseDotenv(envRaw) : {};
 const exampleVars = exampleRaw ? parseDotenv(exampleRaw) : {};
 const composeVars = extractComposeEnvVars(composeRaw);
 
-const allKeys = [...new Set([
-  ...Object.keys(composeVars),
-  ...Object.keys(envVars),
-  ...Object.keys(exampleVars),
-])].sort();
+const searcher = getSearcher();
+
+const allKeys = [
+  ...new Set([
+    ...Object.keys(composeVars),
+    ...Object.keys(envVars),
+    ...Object.keys(exampleVars),
+  ]),
+];
 
 if (allKeys.length === 0) {
   console.log("No environment variables found.");
   process.exit(0);
 }
 
-const rows = allKeys.map((key) => {
-  const inCompose = key in composeVars;
-  const c = composeVars[key];
-  let composeVal = "";
-  if (inCompose) {
-    const tag = c.type === "interpolation" ? " (interpolation)" : c.type === "verbatim" ? " (verbatim)" : "";
-    composeVal = c.value + tag;
-  }
-
-  return {
-    Variable: key,
-    "In Compose": inCompose ? "✔" : "",
-    "Compose Value": composeVal,
-    ".env": envVars[key] ?? "",
-    ".env.example": exampleVars[key] ?? "",
-    "Source Refs": countOccurrences(key),
-  };
-});
+const rows = buildRows(composeVars, envVars, exampleVars, dir, searcher);
 
 console.log(
-  `\nFiles found: ${envRaw !== null ? ".env" : ""}${exampleRaw !== null ? " .env.example" : ""}${composeRaw !== null ? " compose.yaml" : ""}`
+  `\nFiles found:${envRaw !== null ? " .env" : ""}${exampleRaw !== null ? " .env.example" : ""}${composeRaw !== null ? " compose.yaml" : ""}`
 );
 console.log(`Search tool: ${searcher ? searcher.name : "none found"}\n`);
 console.table(rows);
